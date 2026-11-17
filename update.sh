@@ -6,7 +6,7 @@
 #  - removes the default Ubuntu wallpapers and logos
 # Paste this at the VERY BOTTOM of update.sh, then set VERSION to 1.2.0
 # ===================================================================
-set +e
+
 
 # ---------- 1. Hidden updater with percentage ----------
 # (written to a temp file, then moved, so a running updater is never edited in place)
