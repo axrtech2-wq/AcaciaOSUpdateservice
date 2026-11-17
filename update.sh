@@ -1,5 +1,101 @@
 #!/bin/bash
 # ===================================================================
+# AcaciaOS 1.3.1
+#  - makes sure Dash to Panel is installed (root part, runs in the update)
+#  - re-applies the app-drawer layout once per user at login
+# Paste at the VERY BOTTOM of update.sh (below the 1.3.0 block),
+# delete the "set -e" line near the top of update.sh, set VERSION to 1.3.1
+# ===================================================================
+set +e
+
+# ---------- 1. Install Dash to Panel if missing (root) ----------
+D2P=dash-to-panel@jderose9.github.com
+ED=/usr/share/gnome-shell/extensions/$D2P
+if [ ! -d "$ED" ]; then
+  apt-get install -y gnome-shell-extension-dash-to-panel unzip curl >/dev/null 2>&1
+fi
+if [ ! -d "$ED" ]; then
+  GV=$(gnome-shell --version 2>/dev/null | grep -o '[0-9]\+' | head -1)
+  URL=$(curl -fsSL "https://extensions.gnome.org/extension-info/?pk=1160&shell_version=$GV" 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["download_url"])' 2>/dev/null)
+  if [ -n "$URL" ]; then
+    curl -fsSL "https://extensions.gnome.org$URL" -o /tmp/d2p.zip \
+      && mkdir -p "$ED" && unzip -oq /tmp/d2p.zip -d "$ED"
+  fi
+fi
+[ -d "$ED/schemas" ] && [ ! -f "$ED/schemas/gschemas.compiled" ] && glib-compile-schemas "$ED/schemas"
+[ -d "$ED" ] || echo "WARNING: Dash to Panel could not be installed for this GNOME version."
+
+# ---------- 2. Per-user layout (runs once per user at login) ----------
+cat > /tmp/acacia-layout-setup <<'LAYOUTEOF'
+#!/bin/bash
+M="$HOME/.config/acacia-layout-1.3.1"
+[ -f "$M" ] && exit 0
+D2P=dash-to-panel@jderose9.github.com
+ED=/usr/share/gnome-shell/extensions/$D2P
+[ -d "$ED" ] || exit 0
+sleep 8
+
+gnome-extensions disable ubuntu-dock@ubuntu.com 2>/dev/null
+gnome-extensions disable arcmenu@arcmenu.com 2>/dev/null
+gnome-extensions enable $D2P 2>/dev/null
+sleep 3
+
+G() { gsettings --schemadir "$ED/schemas" "$@" 2>/dev/null; }
+P=org.gnome.shell.extensions.dash-to-panel
+ICON=/usr/share/pixmaps/acacia-drawer.png
+[ -f "$ICON" ] || ICON=/usr/share/pixmaps/acaciaos-logo.png
+
+OUT=$(G get $P panel-positions | python3 -c '
+import sys, json, ast
+ids = ["0"]
+try:
+    ids = list(json.loads(ast.literal_eval(sys.stdin.read().strip())).keys()) or ["0"]
+except Exception:
+    pass
+el = [
+ {"element": "showAppsButton",   "visible": True,  "position": "stackedTL"},
+ {"element": "activitiesButton", "visible": False, "position": "stackedTL"},
+ {"element": "leftBox",          "visible": True,  "position": "stackedTL"},
+ {"element": "taskbar",          "visible": True,  "position": "stackedBR"},
+ {"element": "centerBox",        "visible": True,  "position": "stackedBR"},
+ {"element": "rightBox",         "visible": True,  "position": "stackedBR"},
+ {"element": "dateMenu",         "visible": True,  "position": "stackedBR"},
+ {"element": "systemMenu",       "visible": True,  "position": "stackedBR"},
+ {"element": "desktopButton",    "visible": False, "position": "stackedBR"}
+]
+print(json.dumps({i: "TOP" for i in ids}))
+print(json.dumps({i: 38 for i in ids}))
+print(json.dumps({i: el for i in ids}))
+')
+G set $P panel-positions "'$(echo "$OUT" | sed -n 1p)'"
+G set $P panel-sizes "'$(echo "$OUT" | sed -n 2p)'"
+G set $P panel-element-positions "'$(echo "$OUT" | sed -n 3p)'"
+G set $P show-apps-icon-file "'$ICON'"
+G set $P show-favorites true
+G set $P group-apps true
+G set $P appicon-margin 4
+G set $P trans-use-custom-bg true
+G set $P trans-bg-color "'#2d2d2d'"
+
+mkdir -p "$HOME/.config"; touch "$M"
+LAYOUTEOF
+chmod 755 /tmp/acacia-layout-setup
+mv /tmp/acacia-layout-setup /usr/local/bin/acacia-layout-setup
+
+cat > /etc/xdg/autostart/acacia-layout.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Acacia Layout Setup
+Exec=/usr/local/bin/acacia-layout-setup
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+
+echo "AcaciaOS 1.3.1 applied. Log out and back in."
+# ===================== end of 1.3.1 =====================
+
+# ===================================================================
 # AcaciaOS 1.2.0
 #  - hidden updater with a percentage window (no terminal)
 #  - Acacia logo in Settings -> About
