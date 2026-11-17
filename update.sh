@@ -1,4 +1,67 @@
 #!/bin/bash
+# ===== AcaciaOS: block Ubuntu updates and release upgrades =====
+# Stop automatic apt activity
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
+systemctl mask apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+rm -f /etc/apt/apt.conf.d/51acacia-unattended
+
+# Never offer a new Ubuntu release
+[ -f /etc/update-manager/release-upgrades ] && sed -i 's/^Prompt=.*/Prompt=never/' /etc/update-manager/release-upgrades
+
+# Make do-release-upgrade refuse to run (divert only once)
+if ! dpkg-divert --list /usr/bin/do-release-upgrade | grep -q 'do-release-upgrade.real'; then
+  dpkg-divert --add --rename --divert /usr/bin/do-release-upgrade.real /usr/bin/do-release-upgrade 2>/dev/null || true
+fi
+cat > /usr/bin/do-release-upgrade <<'EOF'
+#!/bin/sh
+echo "AcaciaOS: release upgrades are disabled. Updates come from AcaciaUpdates only."
+exit 1
+EOF
+chmod 755 /usr/bin/do-release-upgrade
+apt-mark hold ubuntu-release-upgrader-core ubuntu-release-upgrader-gtk update-manager-core 2>/dev/null || true
+
+# Hide update pop-ups and background downloads
+for f in update-notifier org.gnome.Software; do
+  A=/etc/xdg/autostart/$f.desktop
+  [ -f "$A" ] && ! grep -q '^Hidden=true' "$A" && echo 'Hidden=true' >> "$A"
+done
+if gsettings list-schemas 2>/dev/null | grep -qx org.gnome.software; then
+  printf '[org.gnome.software]\ndownload-updates=false\ndownload-updates-notify=false\n' > /usr/share/glib-2.0/schemas/91_acacia_noupdates.gschema.override
+  glib-compile-schemas /usr/share/glib-2.0/schemas || true
+fi
+
+# Pause Snap auto-refresh
+snap refresh --hold 2>/dev/null || true
+
+# Keep the updater itself free of "apt upgrade" (written to a temp file, then moved)
+cat > /tmp/acacia-update-apply <<'EOF'
+#!/bin/bash
+set -e
+REPO="https://github.com/axrtech2-wq/AcaciaOSUpdateservice"
+D=/var/lib/acacia/repo
+mkdir -p /var/lib/acacia
+echo "== Downloading AcaciaOS update =="
+if [ -d "$D/.git" ]; then
+  git -C "$D" fetch --depth 1 origin
+  git -C "$D" reset --hard FETCH_HEAD
+else
+  rm -rf "$D"; git clone --depth 1 "$REPO" "$D"
+fi
+echo "== Applying AcaciaOS files =="
+[ -f "$D/update.sh" ] && bash "$D/update.sh"
+[ -f "$D/VERSION" ] && cp "$D/VERSION" /etc/acacia-version
+echo "== Done. Version: $(cat /etc/acacia-version). A reboot is recommended. =="
+EOF
+chmod 755 /tmp/acacia-update-apply
+mv /tmp/acacia-update-apply /usr/local/bin/acacia-update-apply
+# ===== end of AcaciaOS update lock =====
+
 # AcaciaOS 1.1.0 - top bar layout
 set -e
 export DEBIAN_FRONTEND=noninteractive
