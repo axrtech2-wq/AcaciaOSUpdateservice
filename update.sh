@@ -1,4 +1,182 @@
 #!/bin/bash
+# ===================================================================
+# AcaciaOS 1.2.0
+#  - hidden updater with a percentage window (no terminal)
+#  - Acacia logo in Settings -> About
+#  - removes the default Ubuntu wallpapers and logos
+# Paste this at the VERY BOTTOM of update.sh, then set VERSION to 1.2.0
+# ===================================================================
+set +e
+
+# ---------- 1. Hidden updater with percentage ----------
+# (written to a temp file, then moved, so a running updater is never edited in place)
+
+cat > /tmp/acacia-update-apply <<'APPLYEOF'
+#!/bin/bash
+# Prints only percentages and "# text" lines so the progress window can read them.
+REPO="https://github.com/axrtech2-wq/AcaciaOSUpdateservice"
+D=/var/lib/acacia/repo
+LOG=/var/lib/acacia/update.log
+mkdir -p /var/lib/acacia
+: > "$LOG"
+
+step() { echo "$1"; echo "# $2"; }
+fail() { echo "# Update failed"; echo 100; exit 1; }
+
+step 5 "Contacting the update server..."
+if [ -d "$D/.git" ]; then
+  git -C "$D" fetch --depth 1 origin >>"$LOG" 2>&1 \
+    && git -C "$D" reset --hard FETCH_HEAD >>"$LOG" 2>&1 || fail
+else
+  rm -rf "$D"
+  git clone --depth 1 "$REPO" "$D" >>"$LOG" 2>&1 || fail
+fi
+
+step 30 "Installing AcaciaOS update..."
+if [ -f "$D/update.sh" ]; then
+  bash "$D/update.sh" >>"$LOG" 2>&1 &
+  PID=$!
+  pct=30
+  while kill -0 "$PID" 2>/dev/null; do
+    [ "$pct" -lt 88 ] && pct=$((pct + 1))
+    echo "$pct"
+    sleep 2
+  done
+  wait "$PID" || fail
+fi
+
+step 92 "Finishing up..."
+[ -f "$D/VERSION" ] && cp "$D/VERSION" /etc/acacia-version
+step 100 "Update complete"
+exit 0
+APPLYEOF
+chmod 755 /tmp/acacia-update-apply
+mv /tmp/acacia-update-apply /usr/local/bin/acacia-update-apply
+
+cat > /tmp/acacia-updates <<'GUIEOF'
+#!/bin/bash
+RAW="https://raw.githubusercontent.com/axrtech2-wq/AcaciaOSUpdateservice/HEAD"
+T="AcaciaUpdates"
+
+zenity --question --title="$T" --width=320 --text="Check for AcaciaOS updates?" --ok-label="Check" --cancel-label="Cancel" || exit 0
+
+LOCAL=$(cat /etc/acacia-version 2>/dev/null || echo 0)
+REMOTE=$(curl -fsSL --max-time 20 "$RAW/VERSION" 2>/dev/null | tr -d '[:space:]')
+if [ -z "$REMOTE" ]; then
+  zenity --error --title="$T" --width=320 --text="Could not reach the update server. Check your internet connection."
+  exit 1
+fi
+if [ "$(printf '%s\n%s\n' "$LOCAL" "$REMOTE" | sort -V | tail -1)" = "$LOCAL" ]; then
+  zenity --info --title="$T" --width=320 --text="AcaciaOS is up to date (version $LOCAL)."
+  exit 0
+fi
+zenity --question --title="$T" --width=340 --text="Update available: $LOCAL -> $REMOTE\n\nInstall it now?" --ok-label="Install" --cancel-label="Later" || exit 0
+
+( pkexec /usr/local/bin/acacia-update-apply 2>/dev/null; rc=$?; [ "$rc" -ne 0 ] && echo 100; exit "$rc" ) \
+  | zenity --progress --title="$T" --text="Starting update..." --percentage=0 --auto-close --no-cancel --width=380
+RC=${PIPESTATUS[0]}
+
+if [ "$RC" -eq 0 ]; then
+  NEW=$(cat /etc/acacia-version 2>/dev/null)
+  zenity --question --title="$T" --width=340 --text="AcaciaOS is now version $NEW.\n\nRestart now to finish?" --ok-label="Restart now" --cancel-label="Later" && systemctl reboot
+elif [ "$RC" -eq 126 ] || [ "$RC" -eq 127 ]; then
+  zenity --info --title="$T" --width=320 --text="Update cancelled."
+else
+  zenity --error --title="$T" --width=340 --text="The update did not finish.\n\nDetails are saved in /var/lib/acacia/update.log"
+fi
+GUIEOF
+chmod 755 /tmp/acacia-updates
+mv /tmp/acacia-updates /usr/local/bin/acacia-updates
+
+# ---------- 2. Replace Ubuntu logos (About page, menus, boot) ----------
+command -v convert >/dev/null 2>&1 || command -v magick >/dev/null 2>&1 || apt-get install -y imagemagick >/dev/null 2>&1
+IM=$(command -v magick || command -v convert)
+IDENT=identify
+[ "$(basename "$IM")" = magick ] && IDENT="magick identify"
+
+LOGOW=/usr/share/pixmaps/acaciaos-logo.png                 # white-window logo (logow.png)
+LOGOB=/usr/share/plymouth/themes/acacia/logo.png           # boot splash logo (logob.png)
+
+swap_logo() {   # $1 = file to overwrite, $2 = Acacia png to use
+  f="$1"; src="$2"
+  case "$f" in
+    *.png)
+      d=$($IDENT -format '%wx%h' "${f}[0]" 2>/dev/null) || return 0
+      $IM "$src" -background none -resize "$d" -gravity center -extent "$d" "$f" 2>/dev/null
+      ;;
+    *.svg|*.svgz)
+      B64=$(base64 -w0 "$src")
+      tmp=$(mktemp)
+      printf '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="256" height="256" viewBox="0 0 256 256"><image width="256" height="256" href="data:image/png;base64,%s" xlink:href="data:image/png;base64,%s"/></svg>\n' "$B64" "$B64" > "$tmp"
+      if [ "${f##*.}" = svgz ]; then gzip -c "$tmp" > "$f"; else cat "$tmp" > "$f"; fi
+      rm -f "$tmp"
+      ;;
+  esac
+}
+
+if [ -f "$LOGOW" ]; then
+  # Make sure os-release points at the Acacia logo
+  grep -q '^LOGO=acaciaos-logo' /usr/lib/os-release || {
+    sed -i '/^LOGO=/d' /usr/lib/os-release
+    echo 'LOGO=acaciaos-logo' >> /usr/lib/os-release
+  }
+
+  # Every Ubuntu / distributor / start-here logo in the icon themes and pixmaps
+  find /usr/share/icons /usr/share/pixmaps -not -path '/usr/share/icons/AcaciaOS/*' \
+    \( -type f -o -type l \) \
+    \( -iname 'ubuntu-logo*' -o -iname 'distributor-logo*' -o -iname 'start-here*' \) \
+    -print0 | while IFS= read -r -d '' f; do swap_logo "$f" "$LOGOW"; done
+
+  # Make the Acacia icon theme provide every name the About page may ask for
+  for n in distributor-logo distributor-logo-icon distributor-logo-text distributor-logo-text-dark ubuntu-logo-icon ubuntu-logo; do
+    cp "$LOGOW" "/usr/share/icons/AcaciaOS/256x256/apps/$n.png" 2>/dev/null
+  done
+fi
+
+# Boot splash: replace Ubuntu logos with the black-background Acacia logo
+if [ -f "$LOGOB" ]; then
+  find /usr/share/plymouth -not -path '/usr/share/plymouth/themes/acacia/*' \
+    \( -type f -o -type l \) \
+    \( -iname '*ubuntu*.png' -o -iname 'watermark.png' -o -iname 'bgrt-fallback.png' \) \
+    -print0 | while IFS= read -r -d '' f; do swap_logo "$f" "$LOGOB"; done
+fi
+
+# Rebuild icon caches
+for d in /usr/share/icons/*/; do
+  [ -f "${d}index.theme" ] && gtk-update-icon-cache -f -t "$d" >/dev/null 2>&1
+done
+update-initramfs -u >/dev/null 2>&1
+
+# ---------- 3. Remove the default Ubuntu wallpapers ----------
+# Only runs if the Acacia wallpapers are really installed, so you can never end up with none.
+if [ -f /usr/share/backgrounds/acacia/background1.png ]; then
+  find /usr/share/backgrounds -mindepth 1 -maxdepth 1 ! -name acacia -exec rm -rf {} + 2>/dev/null
+  find /usr/share/gnome-background-properties -type f ! -name acacia.xml -delete 2>/dev/null
+fi
+
+# If a user's chosen wallpaper no longer exists, switch them to Acacia at login
+cat > /usr/local/bin/acacia-wallpaper-fix <<'FIXEOF'
+#!/bin/bash
+B=/usr/share/backgrounds/acacia/background1.png
+for k in picture-uri picture-uri-dark; do
+  cur=$(gsettings get org.gnome.desktop.background "$k" 2>/dev/null | sed "s/^'file:\/\///;s/'\$//")
+  cur=$(printf '%b' "${cur//%/\\x}")
+  [ -f "$cur" ] || gsettings set org.gnome.desktop.background "$k" "file://$B"
+done
+FIXEOF
+chmod 755 /usr/local/bin/acacia-wallpaper-fix
+cat > /etc/xdg/autostart/acacia-wallpaper-fix.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Acacia Wallpaper Fix
+Exec=/usr/local/bin/acacia-wallpaper-fix
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+
+echo "AcaciaOS 1.2.0 applied. Log out and back in to see the new logo and wallpapers."
+# ===================== end of 1.2.0 =====================
+
 # ===== AcaciaOS: block Ubuntu updates and release upgrades =====
 # Stop automatic apt activity
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
