@@ -1,4 +1,134 @@
 sudo bash <<'ACACIA'
+#!/bin/bash
+# ===================================================================
+# AcaciaOS 1.3.0
+#  - removes the My Acacia app
+#  - finds icon.png (or logo.png) on the flash drive and uses it as the
+#    app-drawer button in the top bar
+#  - pinned and open apps sit next to the clock
+#  - pinned apps are locked (cannot be unpinned or changed by the user)
+#
+# Run it now on the laptop with the flash drive plugged in:
+#     sudo bash update-1.3.0-block.sh
+# AND paste it at the very bottom of update.sh, then set VERSION to 1.3.0
+# ===================================================================
+set +e
+
+# ---------- 1. Remove My Acacia ----------
+pkill -f /usr/local/bin/my-acacia 2>/dev/null
+rm -f /usr/local/bin/my-acacia /usr/share/applications/my-acacia.desktop
+rm -f /home/*/.local/share/applications/my-acacia.desktop 2>/dev/null
+update-desktop-database /usr/share/applications 2>/dev/null
+
+# ---------- 2. Find the drawer icon on the flash drive ----------
+ICON_DST=/usr/share/pixmaps/acacia-drawer.png
+FOUND=""
+for n in icon.png logo.png; do
+  FOUND=$(find /media /mnt /run/media -maxdepth 6 -type f -iname "$n" 2>/dev/null | grep -i acacia | head -1)
+  [ -z "$FOUND" ] && FOUND=$(find /media /mnt /run/media -maxdepth 6 -type f -iname "$n" 2>/dev/null | head -1)
+  [ -n "$FOUND" ] && break
+done
+if [ -n "$FOUND" ]; then
+  install -m 644 "$FOUND" "$ICON_DST"
+  echo "Drawer icon installed from: $FOUND"
+elif [ -f "$ICON_DST" ]; then
+  echo "No flash drive found, keeping the drawer icon that is already installed."
+else
+  echo "WARNING: icon.png / logo.png not found and no icon installed. Plug in the flash drive and run this again."
+fi
+
+# ---------- 3. Lock the pinned apps for every user ----------
+apt-get install -y dconf-cli >/dev/null 2>&1
+mkdir -p /etc/dconf/profile /etc/dconf/db/local.d/locks
+if [ ! -f /etc/dconf/profile/user ]; then
+  printf 'user-db:user\nsystem-db:local\n' > /etc/dconf/profile/user
+elif ! grep -q '^system-db:local' /etc/dconf/profile/user; then
+  echo 'system-db:local' >> /etc/dconf/profile/user
+fi
+
+cat > /etc/dconf/db/local.d/00-acacia <<'EOF'
+[org/gnome/shell]
+favorite-apps=['google-chrome.desktop', 'org.gnome.Nautilus.desktop', 'acacia-updates.desktop', 'org.gnome.Settings.desktop']
+EOF
+cat > /etc/dconf/db/local.d/locks/acacia <<'EOF'
+/org/gnome/shell/favorite-apps
+EOF
+dconf update
+
+# ---------- 4. Top bar layout (runs once per user at login) ----------
+cat > /tmp/acacia-layout-setup <<'LAYOUTEOF'
+#!/bin/bash
+M="$HOME/.config/acacia-layout-1.3.0"
+[ -f "$M" ] && exit 0
+D2P=dash-to-panel@jderose9.github.com
+ARC=arcmenu@arcmenu.com
+[ -d /usr/share/gnome-shell/extensions/$D2P ] || exit 0
+sleep 8
+
+gnome-extensions disable ubuntu-dock@ubuntu.com 2>/dev/null
+gnome-extensions disable $ARC 2>/dev/null
+gnome-extensions enable $D2P 2>/dev/null
+sleep 3
+
+S=/usr/share/gnome-shell/extensions/$D2P/schemas
+G() { gsettings --schemadir "$S" "$@" 2>/dev/null || gsettings "$@" 2>/dev/null; }
+P=org.gnome.shell.extensions.dash-to-panel
+ICON=/usr/share/pixmaps/acacia-drawer.png
+
+# Build the layout for whatever monitor IDs Dash to Panel is using
+OUT=$(G get $P panel-positions | python3 -c '
+import sys, json, ast
+ids = ["0"]
+try:
+    ids = list(json.loads(ast.literal_eval(sys.stdin.read().strip())).keys()) or ["0"]
+except Exception:
+    pass
+el = [
+ {"element": "showAppsButton",   "visible": True,  "position": "stackedTL"},
+ {"element": "activitiesButton", "visible": False, "position": "stackedTL"},
+ {"element": "leftBox",          "visible": True,  "position": "stackedTL"},
+ {"element": "taskbar",          "visible": True,  "position": "stackedBR"},
+ {"element": "centerBox",        "visible": True,  "position": "stackedBR"},
+ {"element": "rightBox",         "visible": True,  "position": "stackedBR"},
+ {"element": "dateMenu",         "visible": True,  "position": "stackedBR"},
+ {"element": "systemMenu",       "visible": True,  "position": "stackedBR"},
+ {"element": "desktopButton",    "visible": False, "position": "stackedBR"}
+]
+print(json.dumps({i: "TOP" for i in ids}))
+print(json.dumps({i: 38 for i in ids}))
+print(json.dumps({i: el for i in ids}))
+')
+POS=$(echo "$OUT" | sed -n 1p)
+SIZ=$(echo "$OUT" | sed -n 2p)
+ELE=$(echo "$OUT" | sed -n 3p)
+
+G set $P panel-positions "'$POS'"
+G set $P panel-sizes "'$SIZ'"
+G set $P panel-element-positions "'$ELE'"
+[ -f "$ICON" ] && G set $P show-apps-icon-file "'$ICON'"
+G set $P show-favorites true
+G set $P group-apps true
+G set $P appicon-margin 4
+G set $P trans-use-custom-bg true
+G set $P trans-bg-color "'#2d2d2d'"
+
+mkdir -p "$HOME/.config"; touch "$M"
+LAYOUTEOF
+chmod 755 /tmp/acacia-layout-setup
+mv /tmp/acacia-layout-setup /usr/local/bin/acacia-layout-setup
+
+cat > /etc/xdg/autostart/acacia-layout.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Acacia Layout Setup
+Exec=/usr/local/bin/acacia-layout-setup
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+
+echo "AcaciaOS 1.3.0 applied. Log out and back in (the layout appears about 10 seconds after login)."
+# ===================== end of 1.3.0 =====================
+
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
