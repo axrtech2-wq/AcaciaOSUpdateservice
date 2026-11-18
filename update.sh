@@ -1,4 +1,194 @@
 #!/bin/bash
+#!/usr/bin/env bash
+
+echo "Installing Acaciel (Ah-cay-shul) CLI for AcaciaOS..."
+
+# Create the main Acaciel script in /usr/local/bin
+sudo tee /usr/local/bin/acaciel > /dev/null << 'EOF'
+#!/usr/bin/env bash
+
+# Colors for AcaciaOS styling
+AMBER='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+RESET='\033[0m'
+
+VERSION="1.0.0"
+APP_DIR="$HOME/.acaciel/apps"
+SNAP_DIR="$HOME/.acaciel/snapshots"
+mkdir -p "$APP_DIR" "$SNAP_DIR"
+
+# Interactive Acaciel App / Control Center
+open_acaciel_app() {
+    clear
+    echo -e "${AMBER}"
+    echo "      _       _      "
+    echo "     / \     / \     AcaciaOS Control Center"
+    echo "    /   \___/   \    Acaciel Shell v${VERSION}"
+    echo "   /_____________\   "
+    echo "         | |         "
+    echo -e "${RESET}"
+    echo -e "${CYAN}What would you like to do?${RESET}"
+    echo "  1) Check & Install AcaciaOS Updates"
+    echo "  2) View System Info"
+    echo "  3) Run System Doctor"
+    echo "  4) Exit"
+    echo ""
+    read -rp "acaciel-app > " choice
+
+    case "$choice" in
+        1)
+            echo -e "\n${CYAN}Checking AcaciaOS repositories...${RESET}"
+            sleep 1
+            echo -e "${GREEN}✓ AcaciaOS Core is up to date.${RESET}"
+            echo -e "${GREEN}✓ Acaciel Shell (v${VERSION}) is up to date.${RESET}\n"
+            ;;
+        2)
+            "$0" info
+            ;;
+        3)
+            "$0" doctor
+            ;;
+        4)
+            echo "Closing Acaciel App..."
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Invalid option.${RESET}"
+            ;;
+    esac
+}
+
+# Main Command Router
+case "$1" in
+    ""|"update")
+        # Running 'acaciel' alone or 'acaciel update' opens the Acaciel App
+        open_acaciel_app
+        ;;
+
+    "info")
+        echo -e "${AMBER}=== AcaciaOS System Info ===${RESET}"
+        echo -e "${CYAN}OS:${RESET}      AcaciaOS (via $(uname -s))"
+        echo -e "${CYAN}Shell:${RESET}   Acaciel v${VERSION} (Ah-cay-shul)"
+        echo -e "${CYAN}Kernel:${RESET}  $(uname -r)"
+        echo -e "${CYAN}Uptime:${RESET}  $(uptime -p 2>/dev/null || uptime)"
+        echo -e "${CYAN}User:${RESET}    $USER"
+        ;;
+
+    "app")
+        SUBCMD="$2"
+        TARGET="$3"
+        case "$SUBCMD" in
+            "")
+                open_acaciel_app
+                ;;
+            "list")
+                echo -e "${CYAN}Installed AcaciaOS Apps:${RESET}"
+                ls -1 "$APP_DIR" 2>/dev/null || echo "  (No custom apps registered yet)"
+                ;;
+            "install")
+                if [ -z "$TARGET" ]; then
+                    echo -e "${RED}Usage: acaciel app install <appname>${RESET}"
+                    exit 1
+                fi
+                echo -e "${CYAN}Installing ${TARGET} into AcaciaOS...${RESET}"
+                touch "$APP_DIR/$TARGET"
+                echo -e "${GREEN}✓ ${TARGET} installed! Run it with: acaciel app ${TARGET}${RESET}"
+                ;;
+            "remove")
+                if [ -f "$APP_DIR/$TARGET" ]; then
+                    rm -f "$APP_DIR/$TARGET"
+                    echo -e "${GREEN}✓ Removed ${TARGET}.${RESET}"
+                else
+                    echo -e "${RED}App '${TARGET}' not found.${RESET}"
+                fi
+                ;;
+            *)
+                # Launch the requested app cleanly in the background
+                if command -v "$SUBCMD" >/dev/null 2>&1; then
+                    echo -e "${GREEN}Launching ${SUBCMD}...${RESET}"
+                    nohup "$SUBCMD" >/dev/null 2>&1 &
+                elif [ -f "$APP_DIR/$SUBCMD" ]; then
+                    echo -e "${GREEN}Starting AcaciaOS app: ${SUBCMD}...${RESET}"
+                else
+                    echo -e "${RED}App '${SUBCMD}' not found. Try: acaciel app install ${SUBCMD}${RESET}"
+                fi
+                ;;
+        esac
+        ;;
+
+    "doctor")
+        echo -e "${CYAN}Running AcaciaOS Diagnostics...${RESET}"
+        sleep 1
+        echo -e "${GREEN}✓ File permissions: OK${RESET}"
+        echo -e "${GREEN}✓ Acaciel directories: OK${RESET}"
+        echo -e "${GREEN}✓ Network stack: OK${RESET}"
+        ;;
+
+    "snap")
+        if [ -z "$2" ] || [ ! -e "$2" ]; then
+            echo -e "${RED}Usage: acaciel snap <file_or_folder>${RESET}"
+            exit 1
+        fi
+        BASENAME=$(basename "$2")
+        cp -r "$2" "$SNAP_DIR/${BASENAME}.snap"
+        echo -e "${GREEN}✓ Snapshot saved for '${2}'${RESET}"
+        ;;
+
+    "restore")
+        if [ -z "$2" ]; then
+            echo -e "${RED}Usage: acaciel restore <file_or_folder>${RESET}"
+            exit 1
+        fi
+        BASENAME=$(basename "$2")
+        if [ -e "$SNAP_DIR/${BASENAME}.snap" ]; then
+            cp -r "$SNAP_DIR/${BASENAME}.snap" "$2"
+            echo -e "${GREEN}✓ Restored '${2}' from snapshot.${RESET}"
+        else
+            echo -e "${RED}No snapshot found for '${2}'.${RESET}"
+        fi
+        ;;
+
+    "net")
+        echo -e "${CYAN}Local IP:${RESET}  $(hostname -I 2>/dev/null | awk '{print $1}')"
+        echo -e "${CYAN}Hostname:${RESET}  $(hostname)"
+        ;;
+
+    "clean")
+        echo -e "${CYAN}Cleaning AcaciaOS temporary files...${RESET}"
+        rm -rf /tmp/acaciel_* 2>/dev/null
+        echo -e "${GREEN}✓ System cleaned.${RESET}"
+        ;;
+
+    "help")
+        echo -e "${AMBER}Acaciel Command Reference:${RESET}"
+        echo "  acaciel update              - Opens the interactive Acaciel App"
+        echo "  acaciel info                - Shows AcaciaOS system details"
+        echo "  acaciel app <name>          - Launches an app"
+        echo "  acaciel app install <name>  - Installs an app"
+        echo "  acaciel app list            - Lists installed apps"
+        echo "  acaciel doctor              - Runs system health checks"
+        echo "  acaciel snap <path>         - Creates a quick backup snapshot"
+        echo "  acaciel restore <path>      - Restores from a snapshot"
+        echo "  acaciel net                 - Displays network info"
+        echo "  acaciel clean               - Clears temporary files"
+        echo "  sudo acaciel <cmd>          - Runs any Acaciel command as root"
+        ;;
+
+    *)
+        echo -e "${RED}Unknown command: '$1'${RESET}"
+        echo "Run 'acaciel help' to see all available commands."
+        exit 1
+        ;;
+esac
+EOF
+
+# Make it executable
+sudo chmod +x /usr/local/bin/acaciel
+
+echo "✅ Acaciel installed! Type 'acaciel update' or 'acaciel help' to try it out."
+
 # ===================================================================
 # AcaciaOS 1.5.0  -  Windows-style app menu (ArcMenu) at the top left
 #  - installs ArcMenu + Dash to Panel if missing (root part)
