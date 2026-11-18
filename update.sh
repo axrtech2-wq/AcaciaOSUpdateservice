@@ -1,5 +1,146 @@
 #!/bin/bash
 # ===================================================================
+# AcaciaOS 1.5.0  -  Windows-style app menu (ArcMenu) at the top left
+#  - installs ArcMenu + Dash to Panel if missing (root part)
+#  - per-user: ArcMenu "Windows 11" layout, Acacia icon, top-left
+#  - writes a log to ~/.cache/acacia-layout.log so problems are visible
+#
+# Run now:   sudo bash update-1.5.0-block.sh      then log out and back in
+# For updates: paste at the VERY BOTTOM of update.sh (below 1.4.0),
+#              set VERSION to 1.5.0 and commit
+# ===================================================================
+set +e
+
+# ---------- 1. Make sure the extensions are installed (root) ----------
+EXTDIR=/usr/share/gnome-shell/extensions
+GV=$(gnome-shell --version 2>/dev/null | grep -o '[0-9]\+' | head -1)
+apt-get install -y curl unzip python3 >/dev/null 2>&1
+apt-get install -y gnome-shell-extension-arc-menu gnome-shell-extension-dash-to-panel >/dev/null 2>&1
+
+get_ext() {   # $1 = extensions.gnome.org id, $2 = uuid
+  [ -d "$EXTDIR/$2" ] && return 0
+  URL=$(curl -fsSL "https://extensions.gnome.org/extension-info/?pk=$1&shell_version=$GV" 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["download_url"])' 2>/dev/null)
+  if [ -n "$URL" ]; then
+    curl -fsSL "https://extensions.gnome.org$URL" -o /tmp/ext.zip \
+      && mkdir -p "$EXTDIR/$2" && unzip -oq /tmp/ext.zip -d "$EXTDIR/$2"
+  fi
+}
+get_ext 3628 arcmenu@arcmenu.com
+get_ext 1160 dash-to-panel@jderose9.github.com
+for u in arcmenu@arcmenu.com dash-to-panel@jderose9.github.com; do
+  [ -d "$EXTDIR/$u/schemas" ] && [ ! -f "$EXTDIR/$u/schemas/gschemas.compiled" ] && glib-compile-schemas "$EXTDIR/$u/schemas"
+  [ -d "$EXTDIR/$u" ] || echo "WARNING: $u is not available for GNOME $GV"
+done
+
+# ---------- 2. Per-user setup (runs once per user at login) ----------
+cat > /tmp/acacia-layout-setup <<'LAYOUTEOF'
+#!/bin/bash
+M="$HOME/.config/acacia-layout-1.5.0"
+[ -f "$M" ] && exit 0
+mkdir -p "$HOME/.cache" "$HOME/.config"
+exec >>"$HOME/.cache/acacia-layout.log" 2>&1
+echo "=== $(date)  $(gnome-shell --version)"
+
+D2P=dash-to-panel@jderose9.github.com
+ARC=arcmenu@arcmenu.com
+BMS=blur-my-shell@aunetx
+X=/usr/share/gnome-shell/extensions
+echo "dash-to-panel installed: $([ -d $X/$D2P ] && echo yes || echo NO)"
+echo "arcmenu installed:       $([ -d $X/$ARC ] && echo yes || echo NO)"
+[ -d "$X/$ARC" ] || { echo "ArcMenu is not installed, stopping."; exit 0; }
+sleep 8
+
+gnome-extensions disable ubuntu-dock@ubuntu.com
+gnome-extensions enable $ARC
+[ -d "$X/$D2P" ] && gnome-extensions enable $D2P
+[ -d "$X/$BMS" ] && gnome-extensions enable $BMS
+sleep 3
+echo "enabled now: $(gnome-extensions list --enabled | tr '\n' ' ')"
+gnome-extensions info $ARC | grep -iE 'state|error'
+
+ICON=/usr/share/pixmaps/acacia-drawer.png
+[ -f "$ICON" ] || ICON=/usr/share/pixmaps/acaciaos-logo.png
+
+A() { gsettings --schemadir "$X/$ARC/schemas" "$@"; }
+G() { gsettings --schemadir "$X/$D2P/schemas" "$@"; }
+B() { gsettings --schemadir "$X/$BMS/schemas" "$@" || gsettings "$@"; }
+
+# --- ArcMenu: Windows 11 style menu, Acacia icon, top left ---
+AP=org.gnome.shell.extensions.arcmenu
+A set $AP menu-layout "'Eleven'"
+A set $AP menu-button-appearance "'Icon'"
+A set $AP menu-button-icon "'Custom_Icon'"
+A set $AP custom-menu-button-icon "'$ICON'"
+A set $AP menu-button-icon-size 28
+A set $AP position-in-panel "'Left'"
+
+# --- Top bar: no separate Show Apps button, apps next to the clock ---
+if [ -d "$X/$D2P" ]; then
+  P=org.gnome.shell.extensions.dash-to-panel
+  OUT=$(G get $P panel-positions | python3 -c '
+import sys, json, ast
+ids = ["0"]
+try:
+    ids = list(json.loads(ast.literal_eval(sys.stdin.read().strip())).keys()) or ["0"]
+except Exception:
+    pass
+el = [
+ {"element": "showAppsButton",   "visible": False, "position": "stackedTL"},
+ {"element": "activitiesButton", "visible": False, "position": "stackedTL"},
+ {"element": "leftBox",          "visible": True,  "position": "stackedTL"},
+ {"element": "taskbar",          "visible": True,  "position": "stackedBR"},
+ {"element": "centerBox",        "visible": True,  "position": "stackedBR"},
+ {"element": "rightBox",         "visible": True,  "position": "stackedBR"},
+ {"element": "dateMenu",         "visible": True,  "position": "stackedBR"},
+ {"element": "systemMenu",       "visible": True,  "position": "stackedBR"},
+ {"element": "desktopButton",    "visible": False, "position": "stackedBR"}
+]
+print(json.dumps({i: "TOP" for i in ids}))
+print(json.dumps({i: 38 for i in ids}))
+print(json.dumps({i: el for i in ids}))
+')
+  G set $P panel-positions "'$(echo "$OUT" | sed -n 1p)'"
+  G set $P panel-sizes "'$(echo "$OUT" | sed -n 2p)'"
+  G set $P panel-element-positions "'$(echo "$OUT" | sed -n 3p)'"
+  G set $P show-favorites true
+  G set $P group-apps true
+  G set $P appicon-margin 4
+  G set $P trans-use-custom-bg true
+  G set $P trans-bg-color "'#1e1e1e'"
+  G set $P trans-use-custom-opacity true
+  G set $P trans-panel-opacity 0.55
+fi
+
+# --- Glass blur ---
+if [ -d "$X/$BMS" ]; then
+  BP=org.gnome.shell.extensions.blur-my-shell
+  for c in overview appfolder panel applications lockscreen; do B set $BP.$c blur true; done
+  B set $BP.applications enable-all true
+  B set $BP.overview sigma 40
+  B set $BP.applications sigma 30
+  B set $BP.panel sigma 30
+fi
+
+touch "$M"
+echo "done"
+LAYOUTEOF
+chmod 755 /tmp/acacia-layout-setup
+mv /tmp/acacia-layout-setup /usr/local/bin/acacia-layout-setup
+
+cat > /etc/xdg/autostart/acacia-layout.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Acacia Layout Setup
+Exec=/usr/local/bin/acacia-layout-setup
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+
+echo "AcaciaOS 1.5.0 applied. Log out and back in, then wait about 15 seconds."
+# ===================== end of 1.5.0 =====================
+
+# ===================================================================
 # AcaciaOS 1.4.0  -  Acacia Workspace
 #  - "Acacia Workspace" login session (the stock Ubuntu sessions are hidden)
 #  - shortcuts + touchpad gesture defaults
