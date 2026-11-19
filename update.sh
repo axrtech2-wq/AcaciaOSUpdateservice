@@ -1,5 +1,1002 @@
 #!/bin/bash
+# ===================================================================
+# AcaciaOS 1.10.0  -  Acaciel 1.2.0
+#  - all acaciel commands are real
+#  - Mobile Mode (fullscreen Android-style home screen)
+#  - menu tidy: hides the default Ubuntu apps once, new installs stay visible
+#
+# Paste at the VERY BOTTOM of update.sh (below the other blocks),
+# make sure update.sh has no "set -e" line, set VERSION to 1.10.0 and commit.
+# ===================================================================
+set +e
+export DEBIAN_FRONTEND=noninteractive
+
+mkdir -p /etc/acacia /var/lib/acacia
+
+# ---------- 0. GTK for Python (Mobile Mode needs it) ----------
+if ! python3 -c 'import gi; gi.require_version("Gtk","3.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
+  apt-get update -qq >/dev/null 2>&1
+  apt-get install -y python3-gi gir1.2-gtk-3.0 >/dev/null 2>&1
+fi
+
+# ---------- 1. Mobile home screen app ----------
+cat > /usr/local/bin/acacia-mobile-home << 'PYEOF'
+#!/usr/bin/env python3
+import os, sys, time, signal, atexit
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, Gio, GLib, Pango
+
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "acaciel-mobile.pid")
+HIDDEN_FILE = "/etc/acacia/hidden-apps.txt"
+WALLPAPER = "/usr/share/backgrounds/acacia/background1.png"
+
+
+def already_running():
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        if pid != os.getpid():
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def cleanup():
+    try:
+        if int(open(PIDFILE).read().strip()) == os.getpid():
+            os.remove(PIDFILE)
+    except Exception:
+        pass
+
+
+def load_hidden():
+    try:
+        return [l.strip().lower() for l in open(HIDDEN_FILE)
+                if l.strip() and not l.strip().startswith("#")]
+    except Exception:
+        return []
+
+
+def load_apps():
+    hidden = load_hidden()
+    apps = []
+    for a in Gio.AppInfo.get_all():
+        if not a.should_show():
+            continue
+        aid = (a.get_id() or "").lower()
+        if any(h in aid for h in hidden):
+            continue
+        apps.append(a)
+    apps.sort(key=lambda a: a.get_display_name().lower())
+    return apps
+
+
+def favorites():
+    out = []
+    try:
+        ids = Gio.Settings.new("org.gnome.shell").get_strv("favorite-apps")
+    except Exception:
+        ids = []
+    for i in ids[:5]:
+        a = Gio.DesktopAppInfo.new(i)
+        if a:
+            out.append(a)
+    return out
+
+
+def css():
+    bg = "background-color: #101218;"
+    if os.path.exists(WALLPAPER):
+        bg = ("background-image: linear-gradient(rgba(10,12,20,0.30), rgba(10,12,20,0.55)), "
+              "url('%s'); background-size: cover; background-position: center;" % WALLPAPER)
+    return (
+        "window.acacia-home { %s }"
+        ".clock { font-size: 72px; font-weight: 300; color: white; text-shadow: 0 2px 10px rgba(0,0,0,0.6); }"
+        ".date { font-size: 17px; color: rgba(255,255,255,0.88); text-shadow: 0 1px 4px rgba(0,0,0,0.6); }"
+        "button.tile { background-image: none; background-color: transparent; border: none;"
+        "  box-shadow: none; padding: 10px; border-radius: 20px; }"
+        "button.tile:hover, button.tile:active { background-color: rgba(255,255,255,0.18); }"
+        "button.tile label { color: white; font-size: 13px; text-shadow: 0 1px 4px rgba(0,0,0,0.85); }"
+        ".dock { background-color: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.26);"
+        "  border-radius: 30px; padding: 8px 16px; }"
+        "button.exit { background-image: none; background-color: rgba(255,255,255,0.18);"
+        "  border: 1px solid rgba(255,255,255,0.28); border-radius: 22px; padding: 10px 20px;"
+        "  color: white; font-size: 14px; box-shadow: none; }"
+        "button.exit:hover { background-color: rgba(255,255,255,0.30); }"
+    ) % bg
+
+
+class Home(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Acacia Mobile")
+        self.set_decorated(False)
+        self.get_style_context().add_class("acacia-home")
+        self._cols = 0
+
+        prov = Gtk.CssProvider()
+        prov.load_from_data(css().encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(root)
+
+        # Clock and date
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.CENTER)
+        top.set_margin_top(36)
+        top.set_margin_bottom(18)
+        self.clock = Gtk.Label()
+        self.clock.get_style_context().add_class("clock")
+        self.date = Gtk.Label()
+        self.date.get_style_context().add_class("date")
+        top.pack_start(self.clock, False, False, 0)
+        top.pack_start(self.date, False, False, 0)
+        root.pack_start(top, False, False, 0)
+
+        # All apps (touch-scrollable)
+        self.flow = Gtk.FlowBox()
+        self.flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flow.set_homogeneous(True)
+        self.flow.set_column_spacing(8)
+        self.flow.set_row_spacing(14)
+        self.flow.set_valign(Gtk.Align.START)
+        self.flow.set_halign(Gtk.Align.CENTER)
+        self.flow.set_margin_start(40)
+        self.flow.set_margin_end(40)
+        for info in load_apps():
+            self.flow.add(self.tile(info, 64, True))
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_kinetic_scrolling(True)
+        scroller.set_overlay_scrolling(True)
+        scroller.add(self.flow)
+        root.pack_start(scroller, True, True, 0)
+
+        # Bottom row: Desktop button + dock with pinned apps
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bottom.set_margin_start(24)
+        bottom.set_margin_end(24)
+        bottom.set_margin_top(10)
+        bottom.set_margin_bottom(18)
+        exit_btn = Gtk.Button(label="Desktop")
+        exit_btn.get_style_context().add_class("exit")
+        exit_btn.set_valign(Gtk.Align.CENTER)
+        exit_btn.connect("clicked", lambda b: Gtk.main_quit())
+        bottom.pack_start(exit_btn, False, False, 0)
+        dock = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        dock.get_style_context().add_class("dock")
+        dock.set_halign(Gtk.Align.CENTER)
+        dock.set_hexpand(True)
+        for info in favorites():
+            dock.pack_start(self.tile(info, 52, False), False, False, 0)
+        bottom.pack_start(dock, True, True, 0)
+        root.pack_start(bottom, False, False, 0)
+
+        self.connect("size-allocate", self.on_size)
+        self.connect("key-press-event", self.on_key)
+        self.tick()
+        GLib.timeout_add_seconds(5, self.tick)
+        self.fullscreen()
+
+    def tile(self, info, size, with_label):
+        btn = Gtk.Button()
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.get_style_context().add_class("tile")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        gicon = info.get_icon()
+        if gicon:
+            img = Gtk.Image.new_from_gicon(gicon, Gtk.IconSize.DIALOG)
+        else:
+            img = Gtk.Image.new_from_icon_name("application-x-executable", Gtk.IconSize.DIALOG)
+        img.set_pixel_size(size)
+        box.pack_start(img, False, False, 0)
+        if with_label:
+            lab = Gtk.Label(label=info.get_display_name())
+            lab.set_ellipsize(Pango.EllipsizeMode.END)
+            lab.set_max_width_chars(12)
+            lab.set_justify(Gtk.Justification.CENTER)
+            box.pack_start(lab, False, False, 0)
+        btn.add(box)
+        btn.set_tooltip_text(info.get_display_name())
+        btn.connect("clicked", lambda b: self.launch(info))
+        return btn
+
+    def launch(self, info):
+        try:
+            ctx = Gdk.Display.get_default().get_app_launch_context()
+            info.launch([], ctx)
+        except Exception as e:
+            print("launch failed:", e, file=sys.stderr)
+
+    def on_size(self, widget, alloc):
+        cols = max(3, alloc.width // 150)
+        if cols != self._cols:
+            self._cols = cols
+            self.flow.set_max_children_per_line(cols)
+
+    def on_key(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            Gtk.main_quit()
+            return True
+        return False
+
+    def tick(self):
+        now = time.localtime()
+        self.clock.set_text(time.strftime("%I:%M", now).lstrip("0"))
+        self.date.set_text(time.strftime("%A, %B %d", now))
+        return True
+
+
+def main():
+    if already_running():
+        sys.exit(0)
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(cleanup)
+    win = Home()
+    win.show_all()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, Gtk.main_quit)
+    Gtk.main()
+
+
+main()
+PYEOF
+chmod 755 /usr/local/bin/acacia-mobile-home
+
+# ---------- 2. Watcher: Mobile Mode follows keyboard / mouse ----------
+cat > /usr/local/bin/acaciel-mobile-watch << 'WATCHEOF'
 #!/usr/bin/env bash
+# Runs in the background after login. Only acts if "acaciel mobile auto on" was set.
+CONF="$HOME/.config/acaciel"
+PIDF="${XDG_RUNTIME_DIR:-/tmp}/acaciel-mobile.pid"
+
+running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+
+# Prints "<has_touchscreen> <has_external_keyboard_or_mouse>"
+scan() {
+    local touch=0 ext=0 d props path bus kbd mouse
+    for d in /sys/class/input/event*; do
+        props=$(udevadm info -q property -p "$d" 2>/dev/null) || continue
+        case "$props" in *ID_INPUT_TOUCHSCREEN=1*) touch=1 ;; esac
+        kbd=0; mouse=0
+        case "$props" in *ID_INPUT_KEYBOARD=1*) kbd=1 ;; esac
+        case "$props" in *ID_INPUT_MOUSE=1*) mouse=1 ;; esac
+        if [ $((kbd + mouse)) -gt 0 ]; then
+            bus=$(printf '%s\n' "$props" | sed -n 's/^ID_BUS=//p')
+            path=$(printf '%s\n' "$props" | sed -n 's/^DEVPATH=//p')
+            case "$bus:$path" in
+                usb:*|bluetooth:*|*:*/uhid/*|*:*bluetooth*) ext=1 ;;
+            esac
+        fi
+    done
+    echo "$touch $ext"
+}
+
+prev_ext=1   # so "no keyboard/mouse" at login counts as a change
+while true; do
+    if [ -f "$CONF/mobile-auto" ]; then
+        read -r touch ext <<< "$(scan)"
+        if [ "$touch" = 1 ]; then
+            if [ "$ext" = 0 ] && [ "$prev_ext" = 1 ]; then
+                running || nohup acacia-mobile-home >/dev/null 2>&1 &
+            elif [ "$ext" = 1 ] && [ "$prev_ext" = 0 ]; then
+                running && kill "$(cat "$PIDF")" 2>/dev/null
+            fi
+        fi
+        prev_ext=$ext
+    else
+        prev_ext=1
+    fi
+    sleep 4
+done
+WATCHEOF
+chmod 755 /usr/local/bin/acaciel-mobile-watch
+
+cat > /etc/xdg/autostart/acaciel-mobile-watch.desktop << 'DESKEOF'
+[Desktop Entry]
+Type=Application
+Name=Acaciel Mobile Watch
+Exec=/usr/local/bin/acaciel-mobile-watch
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+DESKEOF
+
+# ---------- 3. Menu tidy helper ----------
+if [ ! -f /etc/acacia/menu-keep.txt ]; then
+cat > /etc/acacia/menu-keep.txt << 'KEEPEOF'
+# Apps that stay in the menu when "acacia-menu tidy" runs.
+# One word per line; an app stays if its desktop id contains the word.
+snap-store
+org.gnome.clocks
+org.gnome.cheese
+org.gnome.calculator
+firefox
+org.gnome.texteditor
+org.gnome.terminal
+ptyxis
+org.gnome.console
+org.gnome.settings
+org.gnome.nautilus
+google-chrome
+acacia-updates
+KEEPEOF
+fi
+
+cat > /usr/local/bin/acacia-menu << 'MENUEOF'
+#!/usr/bin/env bash
+# acacia-menu  tidy [--force] | hide <app> | show <app|all> | list
+OVR=/usr/local/share/applications
+STATE=/var/lib/acacia
+HIDDEN_DB="$STATE/menu-hidden.txt"     # lines: id|pre   (pre=1 if an override already existed)
+KEEP=/etc/acacia/menu-keep.txt
+DIRS=(/usr/share/applications /var/lib/snapd/desktop/applications /var/lib/flatpak/exports/share/applications)
+
+need_root() { [ "$(id -u)" -eq 0 ] || { echo "Run this with sudo."; exit 1; }; }
+
+all_ids() {
+    local d f
+    for d in "${DIRS[@]}"; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.desktop; do
+            [ -f "$f" ] || continue
+            printf '%s\t%s\n' "$(basename "$f")" "$f"
+        done
+    done | awk -F'\t' '!seen[$1]++'
+}
+
+keep_match() {
+    local low="${1,,}" k
+    [ -f "$KEEP" ] || return 1
+    while IFS= read -r k; do
+        k="${k,,}"; k="${k//[[:space:]]/}"
+        [ -z "$k" ] && continue
+        case "$k" in \#*) continue ;; esac
+        case "$low" in *"$k"*) return 0 ;; esac
+    done < "$KEEP"
+    return 1
+}
+
+hide_one() {
+    local id="$1" src="$2" dst="$OVR/$1" pre=0
+    [ -f "$dst" ] && { pre=1; src="$dst"; }
+    mkdir -p "$OVR" "$STATE"
+    sed '/^NoDisplay=/d' "$src" | sed '0,/^\[Desktop Entry\]/ s//[Desktop Entry]\nNoDisplay=true/' > "$dst.tmp" \
+        && mv "$dst.tmp" "$dst"
+    chmod 644 "$dst"
+    grep -qF "$id|" "$HIDDEN_DB" 2>/dev/null || echo "$id|$pre" >> "$HIDDEN_DB"
+}
+
+# Apps currently shown in the menu: id <TAB> original file <TAB> name
+shown_apps() {
+    local id src cur name
+    while IFS=$'\t' read -r id src; do
+        grep -qiE '^Type=Application' "$src" || continue
+        cur="$src"; [ -f "$OVR/$id" ] && cur="$OVR/$id"
+        grep -qiE '^(NoDisplay|Hidden)=true' "$cur" && continue
+        name=$(grep -m1 '^Name=' "$cur" | cut -d= -f2-)
+        printf '%s\t%s\t%s\n' "$id" "$src" "$name"
+    done < <(all_ids)
+}
+
+cmd_tidy() {
+    need_root
+    mkdir -p "$STATE"
+    if [ -f "$STATE/menu-tidied" ] && [ "$1" != "--force" ]; then
+        echo "Menu was already tidied. Apps you install stay visible."
+        return 0
+    fi
+    local n=0 id src name
+    while IFS=$'\t' read -r id src name; do
+        keep_match "$id" && continue
+        hide_one "$id" "$src"
+        n=$((n + 1))
+    done < <(shown_apps)
+    touch "$STATE/menu-tidied"
+    update-desktop-database "$OVR" 2>/dev/null
+    echo "Hid $n default apps. Apps you install from now on stay visible."
+}
+
+cmd_hide() {
+    need_root
+    local q="${1,,}"
+    [ -z "$q" ] && { echo "Usage: acacia-menu hide <app name>"; return 1; }
+    local all exact pick count id src name
+    all=$(shown_apps)
+    exact=$(printf '%s\n' "$all" | awk -F'\t' -v q="$q" 'tolower($3)==q || tolower($1)==q || tolower($1)==q".desktop"')
+    pick="$exact"
+    [ -z "$pick" ] && pick=$(printf '%s\n' "$all" | awk -F'\t' -v q="$q" 'index(tolower($3),q) || index(tolower($1),q)')
+    count=$(printf '%s\n' "$pick" | grep -c .)
+    if [ "$count" -eq 0 ]; then echo "No visible app matches '$1'."; return 1; fi
+    if [ "$count" -gt 1 ]; then
+        echo "More than one app matches '$1'. Be more specific:"
+        printf '%s\n' "$pick" | awk -F'\t' '{printf "  %s  (%s)\n", $3, $1}'
+        return 1
+    fi
+    IFS=$'\t' read -r id src name <<< "$pick"
+    hide_one "$id" "$src"
+    update-desktop-database "$OVR" 2>/dev/null
+    echo "Hidden: $name"
+}
+
+cmd_show() {
+    need_root
+    local q="${1,,}" n=0 id pre name
+    [ -z "$q" ] && { echo "Usage: acacia-menu show <app name | all>"; return 1; }
+    [ -s "$HIDDEN_DB" ] || { echo "No apps are hidden."; return 0; }
+    while IFS='|' read -r id pre; do
+        [ -z "$id" ] && continue
+        name=$(grep -m1 '^Name=' "$OVR/$id" 2>/dev/null | cut -d= -f2-)
+        if [ "$q" != "all" ]; then
+            case "${id,,} ${name,,}" in *"$q"*) ;; *) continue ;; esac
+        fi
+        if [ "$pre" = 1 ]; then sed -i '/^NoDisplay=/d' "$OVR/$id"; else rm -f "$OVR/$id"; fi
+        awk -F'|' -v id="$id" '$1!=id' "$HIDDEN_DB" > "$HIDDEN_DB.tmp" && mv "$HIDDEN_DB.tmp" "$HIDDEN_DB"
+        echo "  shown again: ${name:-$id}"
+        n=$((n + 1))
+    done < <(cat "$HIDDEN_DB")
+    update-desktop-database "$OVR" 2>/dev/null
+    [ "$n" -eq 0 ] && echo "No hidden app matches '$1'."
+    return 0
+}
+
+cmd_list() {
+    local id pre name
+    [ -s "$HIDDEN_DB" ] || { echo "No apps are hidden."; return 0; }
+    while IFS='|' read -r id pre; do
+        [ -z "$id" ] && continue
+        name=$(grep -m1 '^Name=' "$OVR/$id" 2>/dev/null | cut -d= -f2-)
+        printf '  %-34s %s\n' "${name:-?}" "$id"
+    done < "$HIDDEN_DB"
+}
+
+case "$1" in
+    tidy) cmd_tidy "$2" ;;
+    hide) cmd_hide "$2" ;;
+    show) cmd_show "$2" ;;
+    list) cmd_list ;;
+    *) echo "Usage: acacia-menu tidy | hide <app> | show <app|all> | list"; exit 1 ;;
+esac
+MENUEOF
+chmod 755 /usr/local/bin/acacia-menu
+
+# Hide the default Ubuntu apps ONCE per machine (new installs stay visible)
+/usr/local/bin/acacia-menu tidy
+
+# ---------- 4. The acaciel command ----------
+cat > /usr/local/bin/acaciel << 'EOF'
+#!/usr/bin/env bash
+
+# Colors for AcaciaOS styling
+AMBER='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+RESET='\033[0m'
+
+VERSION="1.2.0"
+APP_DIR="$HOME/.acaciel/apps"
+SNAP_DIR="$HOME/.acaciel/snapshots"
+CONF_DIR="$HOME/.config/acaciel"
+MOBILE_PID="${XDG_RUNTIME_DIR:-/tmp}/acaciel-mobile.pid"
+UPDATE_RAW="https://raw.githubusercontent.com/axrtech2-wq/AcaciaOSUpdateservice/HEAD"
+SUDO=""
+[ "$(id -u)" -ne 0 ] && SUDO="sudo"
+mkdir -p "$APP_DIR" "$SNAP_DIR" "$CONF_DIR"
+
+ok()   { echo -e "${GREEN}✓ $*${RESET}"; }
+warn() { echo -e "${AMBER}! $*${RESET}"; }
+bad()  { echo -e "${RED}✗ $*${RESET}"; }
+note() { echo -e "${CYAN}$*${RESET}"; }
+
+# ---------------------------------------------------------------
+# Mobile mode
+# ---------------------------------------------------------------
+mobile_running() { [ -f "$MOBILE_PID" ] && kill -0 "$(cat "$MOBILE_PID")" 2>/dev/null; }
+
+mobile_start() {
+    if ! command -v acacia-mobile-home >/dev/null 2>&1; then
+        bad "Mobile mode is not installed. Run AcaciaUpdates to get it."
+        return 1
+    fi
+    if [ -z "${WAYLAND_DISPLAY}${DISPLAY}" ]; then
+        bad "Mobile mode needs the desktop. Run it from a terminal on the AcaciaOS desktop."
+        return 1
+    fi
+    if mobile_running; then
+        note "Mobile mode is already on."
+        return 0
+    fi
+    nohup acacia-mobile-home >/dev/null 2>&1 &
+    sleep 1.5
+    if mobile_running; then
+        ok "Mobile mode enabled.  (run 'acaciel mobile' again, or press Esc, to leave)"
+    else
+        bad "Mobile mode could not start. Run 'acacia-mobile-home' by itself to see the error."
+        return 1
+    fi
+}
+
+mobile_stop() {
+    if mobile_running; then
+        kill "$(cat "$MOBILE_PID")" 2>/dev/null
+        ok "Mobile mode disabled."
+    else
+        note "Mobile mode is already off."
+    fi
+}
+
+# ---------------------------------------------------------------
+# Updates (terminal version of AcaciaUpdates)
+# ---------------------------------------------------------------
+acaciel_update_text() {
+    note "Checking AcaciaOS updates..."
+    local LOCAL REMOTE yn rc line
+    LOCAL=$(cat /etc/acacia-version 2>/dev/null || echo 0)
+    REMOTE=$(curl -fsSL --max-time 20 "$UPDATE_RAW/VERSION" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$REMOTE" ]; then
+        bad "Could not reach the update server. Check your internet connection."
+        return 1
+    fi
+    if [ "$(printf '%s\n%s\n' "$LOCAL" "$REMOTE" | sort -V | tail -1)" = "$LOCAL" ]; then
+        ok "AcaciaOS is up to date (version ${LOCAL})."
+        return 0
+    fi
+    echo -e "${AMBER}Update available: ${LOCAL} -> ${REMOTE}${RESET}"
+    read -rp "Install now? [y/N] " yn
+    case "$yn" in y|Y) ;; *) echo "Cancelled."; return 0 ;; esac
+
+    $SUDO /usr/local/bin/acacia-update-apply | while IFS= read -r line; do
+        case "$line" in
+            "#"*) echo -e "  ${line#\# }" ;;
+            ""|*[!0-9]*) ;;
+            *) printf '  [%3s%%]\n' "$line" ;;
+        esac
+    done
+    rc=${PIPESTATUS[0]}
+    if [ "$rc" -eq 0 ]; then
+        ok "AcaciaOS is now version $(cat /etc/acacia-version). A restart is recommended."
+    else
+        bad "The update did not finish. Details: /var/lib/acacia/update.log"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------
+# Info
+# ---------------------------------------------------------------
+acaciel_info() {
+    echo -e "${AMBER}=== AcaciaOS System Info ===${RESET}"
+    echo -e "${CYAN}OS:${RESET}        AcaciaOS $(cat /etc/acacia-version 2>/dev/null)"
+    echo -e "${CYAN}Acaciel:${RESET}   v${VERSION} (Ah-cay-shul)"
+    echo -e "${CYAN}Kernel:${RESET}    $(uname -r)"
+    echo -e "${CYAN}Desktop:${RESET}   ${XDG_CURRENT_DESKTOP:-unknown} (${XDG_SESSION_TYPE:-unknown})"
+    echo -e "${CYAN}CPU:${RESET}       $(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | xargs)"
+    echo -e "${CYAN}Memory:${RESET}    $(free -h | awk '/^Mem:/ {print $3 " used of " $2}')"
+    echo -e "${CYAN}Disk (/):${RESET}  $(df -h / | awk 'NR==2 {print $3 " used of " $2 " (" $5 ")"}')"
+    echo -e "${CYAN}Uptime:${RESET}    $(uptime -p 2>/dev/null || uptime)"
+    echo -e "${CYAN}User:${RESET}      $USER on $(hostname)"
+}
+
+# ---------------------------------------------------------------
+# Doctor
+# ---------------------------------------------------------------
+acaciel_doctor() {
+    note "Running AcaciaOS diagnostics..."
+    local issues=0 pct avail f v
+
+    if grep -q '^ID=acaciaos' /usr/lib/os-release 2>/dev/null && [ -f /etc/acacia-version ]; then
+        ok "OS identity: AcaciaOS $(cat /etc/acacia-version)"
+    else
+        warn "OS identity: AcaciaOS branding is incomplete"; issues=$((issues + 1))
+    fi
+
+    pct=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+    if [ "${pct:-0}" -ge 90 ]; then bad "Disk: ${pct}% full (run 'acaciel clean')"; issues=$((issues + 1))
+    elif [ "${pct:-0}" -ge 80 ]; then warn "Disk: ${pct}% full"; issues=$((issues + 1))
+    else ok "Disk: ${pct}% used"; fi
+
+    avail=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
+    if [ "${avail:-0}" -lt 300 ]; then warn "Memory: only ${avail} MB free"; issues=$((issues + 1))
+    else ok "Memory: ${avail} MB available"; fi
+
+    if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then ok "Internet: reachable"
+    else bad "Internet: no connection"; issues=$((issues + 1)); fi
+    if getent hosts github.com >/dev/null 2>&1; then ok "DNS: working"
+    else bad "DNS: cannot resolve github.com"; issues=$((issues + 1)); fi
+
+    v=$(curl -fsSL --max-time 10 "$UPDATE_RAW/VERSION" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$v" ]; then ok "Update server: reachable (latest version $v)"
+    else warn "Update server: not reachable"; issues=$((issues + 1)); fi
+
+    f=$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)
+    if [ "$f" -eq 0 ]; then ok "System services: none failed"
+    else warn "$f failed service(s): $(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"; issues=$((issues + 1)); fi
+
+    if [ -z "$(dpkg --audit 2>/dev/null)" ]; then ok "Packages: no broken packages"
+    else bad "Packages: broken packages found (run: sudo dpkg --configure -a)"; issues=$((issues + 1)); fi
+
+    if [ -f /var/run/reboot-required ]; then warn "A restart is pending"; issues=$((issues + 1))
+    else ok "No restart pending"; fi
+
+    if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ]; then ok "Clock: synchronized"
+    else warn "Clock: not synchronized"; issues=$((issues + 1)); fi
+
+    if systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null | grep -qE 'masked|disabled'; then
+        ok "Ubuntu auto-updates: off (by design)"
+    else
+        warn "Ubuntu auto-updates are ON"; issues=$((issues + 1))
+    fi
+    if grep -q '^Prompt=never' /etc/update-manager/release-upgrades 2>/dev/null; then ok "New-release upgrades: blocked"
+    else warn "New-release upgrades are not blocked"; issues=$((issues + 1)); fi
+
+    if [ -f /usr/share/backgrounds/acacia/background1.png ]; then ok "Wallpapers: present"
+    else warn "Wallpapers: Acacia wallpapers missing"; issues=$((issues + 1)); fi
+
+    if command -v acacia-mobile-home >/dev/null 2>&1; then ok "Mobile mode: installed"
+    else bad "Mobile mode: not installed"; issues=$((issues + 1)); fi
+
+    echo
+    if [ "$issues" -eq 0 ]; then ok "Everything looks healthy."
+    else warn "$issues thing(s) need attention."; fi
+}
+
+# ---------------------------------------------------------------
+# Apps
+# ---------------------------------------------------------------
+PROTECTED='^(ubuntu-desktop.*|gnome-shell|gdm3|systemd|sudo|apt|dpkg|libc6|network-manager|linux-.*|grub.*|plymouth.*|acacia-.*)$'
+
+app_install() {
+    local t="$1" via="$2" yn
+    if [ -z "$t" ]; then echo "Usage: acaciel app install <name> [--apt|--snap|--flatpak]"; return 1; fi
+    case "$via" in --apt) via=apt ;; --snap) via=snap ;; --flatpak) via=flatpak ;; "") ;; *) bad "Unknown option $via"; return 1 ;; esac
+
+    if [ -z "$via" ]; then
+        if ! apt-cache show "$t" >/dev/null 2>&1; then
+            note "Refreshing package lists..."
+            $SUDO apt-get update -qq
+        fi
+        if apt-cache show "$t" >/dev/null 2>&1; then via=apt
+        elif command -v snap >/dev/null 2>&1 && snap info "$t" >/dev/null 2>&1; then via=snap
+        else bad "'$t' was not found in apt or snap. Check the name."; return 1; fi
+    fi
+
+    note "Installing $t with $via..."
+    case "$via" in
+        apt)     $SUDO apt-get install -y "$t" || { bad "Install failed."; return 1; } ;;
+        snap)
+            if ! $SUDO snap install "$t"; then
+                read -rp "Try classic confinement? [y/N] " yn
+                case "$yn" in y|Y) $SUDO snap install --classic "$t" || { bad "Install failed."; return 1; } ;; *) return 1 ;; esac
+            fi
+            ;;
+        flatpak) $SUDO flatpak install -y flathub "$t" || { bad "Install failed."; return 1; } ;;
+    esac
+    echo "$via" > "$APP_DIR/$t"
+    ok "$t installed. It is in your menu; or run: acaciel app $t"
+}
+
+app_remove() {
+    local t="$1" via
+    if [ -z "$t" ]; then echo "Usage: acaciel app remove <name>"; return 1; fi
+    if printf '%s' "$t" | grep -qE "$PROTECTED"; then
+        bad "'$t' is part of the system and will not be removed by Acaciel."
+        return 1
+    fi
+    via=$(cat "$APP_DIR/$t" 2>/dev/null)
+    if [ -z "$via" ]; then
+        if dpkg -s "$t" >/dev/null 2>&1; then via=apt
+        elif command -v snap >/dev/null 2>&1 && snap list "$t" >/dev/null 2>&1; then via=snap
+        else bad "'$t' is not installed."; return 1; fi
+    fi
+    case "$via" in
+        apt)     $SUDO apt-get remove "$t" || return 1 ;;   # apt shows the plan and asks first
+        snap)    $SUDO snap remove "$t" || return 1 ;;
+        flatpak) $SUDO flatpak uninstall "$t" || return 1 ;;
+    esac
+    rm -f "$APP_DIR/$t"
+    ok "Removed $t."
+}
+
+app_list() {
+    note "Apps in your menu:"
+    python3 - << 'PYAPPS'
+from gi.repository import Gio
+names = sorted({a.get_display_name() for a in Gio.AppInfo.get_all() if a.should_show()}, key=str.lower)
+for n in names:
+    print("  " + n)
+PYAPPS
+    echo
+    if [ -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]; then
+        note "Installed with Acaciel:"
+        for f in "$APP_DIR"/*; do echo "  $(basename "$f")  ($(cat "$f"))"; done
+    fi
+}
+
+app_launch() {
+    local q="$1"
+    if python3 - "$q" << 'PYLAUNCH'
+import sys
+from gi.repository import Gio
+q = sys.argv[1].lower()
+apps = [a for a in Gio.AppInfo.get_all() if a.should_show()]
+def score(a):
+    n = a.get_display_name().lower()
+    i = (a.get_id() or "").lower().replace(".desktop", "")
+    if q == n or q == i: return 0
+    if n.startswith(q): return 1
+    if q in n or q in i: return 2
+    return 9
+best = min(apps, key=score, default=None)
+if best is not None and score(best) < 9:
+    best.launch([], None)
+    print(best.get_display_name())
+    sys.exit(0)
+sys.exit(1)
+PYLAUNCH
+    then
+        ok "Launching."
+    elif command -v "$q" >/dev/null 2>&1; then
+        ok "Launching $q..."
+        nohup "$q" >/dev/null 2>&1 &
+    else
+        bad "App '$q' not found. Try: acaciel app install $q"
+    fi
+}
+
+# ---------------------------------------------------------------
+# Main command router
+# ---------------------------------------------------------------
+open_acaciel_app() {
+    clear
+    echo -e "${AMBER}"
+    echo "      _       _      "
+    echo "     / \     / \     AcaciaOS Control Center"
+    echo "    /   \___/   \    Acaciel Shell v${VERSION}"
+    echo "   /_____________\   "
+    echo "         | |         "
+    echo -e "${RESET}"
+    note "What would you like to do?"
+    echo "  1) Check & Install AcaciaOS Updates"
+    echo "  2) View System Info"
+    echo "  3) Run System Doctor"
+    echo "  4) Toggle Mobile Mode"
+    echo "  5) Clean up the system"
+    echo "  6) Exit"
+    echo ""
+    read -rp "acaciel-app > " choice
+    case "$choice" in
+        1) acaciel_update_text ;;
+        2) acaciel_info ;;
+        3) acaciel_doctor ;;
+        4) "$0" mobile ;;
+        5) "$0" clean ;;
+        6) echo "Closing Acaciel App..."; exit 0 ;;
+        *) bad "Invalid option." ;;
+    esac
+}
+
+case "$1" in
+    "")
+        open_acaciel_app
+        ;;
+
+    "-v"|"--version"|"version")
+        echo "Acaciel v${VERSION}"
+        ;;
+
+    "update")
+        # Opens the AcaciaUpdates app; falls back to the terminal version
+        if [ "$2" = "--text" ] || [ -z "${WAYLAND_DISPLAY}${DISPLAY}" ] || ! command -v acacia-updates >/dev/null 2>&1; then
+            acaciel_update_text
+        else
+            note "Opening AcaciaUpdates..."
+            nohup acacia-updates >/dev/null 2>&1 &
+        fi
+        ;;
+
+    "mobile")
+        if [ "$(id -u)" -eq 0 ]; then
+            bad "Run 'acaciel mobile' as your normal user, not with sudo."
+            exit 1
+        fi
+        case "$2" in
+            ""|"toggle") if mobile_running; then mobile_stop; else mobile_start; fi ;;
+            "on")        mobile_start ;;
+            "off")       mobile_stop ;;
+            "status")
+                if mobile_running; then ok "Mobile mode: ON"; else note "Mobile mode: OFF"; fi
+                if [ -f "$CONF_DIR/mobile-auto" ]; then note "Auto mode:   ON"; else note "Auto mode:   OFF"; fi
+                ;;
+            "auto")
+                case "$3" in
+                    "on")
+                        touch "$CONF_DIR/mobile-auto"
+                        ok "Auto mode on. Mobile mode turns on when no external keyboard or mouse is connected (needs a touchscreen), and off when one is."
+                        pgrep -f acaciel-mobile-watch >/dev/null || { nohup acaciel-mobile-watch >/dev/null 2>&1 & }
+                        ;;
+                    "off")
+                        rm -f "$CONF_DIR/mobile-auto"
+                        ok "Auto mode off."
+                        ;;
+                    *) echo "Usage: acaciel mobile auto on|off" ;;
+                esac
+                ;;
+            *) echo "Usage: acaciel mobile [on|off|status|auto on|auto off]" ;;
+        esac
+        ;;
+
+    "menu")
+        if ! command -v acacia-menu >/dev/null 2>&1; then
+            bad "acacia-menu is missing. Run AcaciaUpdates to get it."
+            exit 1
+        fi
+        case "$2" in
+            "list") acacia-menu list ;;
+            "hide") [ -z "$3" ] && { echo "Usage: acaciel menu hide <app name>"; exit 1; }; $SUDO acacia-menu hide "$3" ;;
+            "show") [ -z "$3" ] && { echo "Usage: acaciel menu show <app name | all>"; exit 1; }; $SUDO acacia-menu show "$3" ;;
+            *) echo "Usage: acaciel menu list | hide <app> | show <app|all>" ;;
+        esac
+        ;;
+
+    "info")
+        acaciel_info
+        ;;
+
+    "app")
+        case "$2" in
+            "")        open_acaciel_app ;;
+            "list")    app_list ;;
+            "install") app_install "$3" "$4" ;;
+            "remove")  app_remove "$3" ;;
+            *)         app_launch "$2" ;;
+        esac
+        ;;
+
+    "doctor")
+        acaciel_doctor
+        ;;
+
+    "snap")
+        case "$2" in
+            "")
+                echo "Usage: acaciel snap <file_or_folder>   |   acaciel snap list"
+                exit 1
+                ;;
+            "list")
+                if ls "$SNAP_DIR"/*.tar.gz >/dev/null 2>&1; then
+                    note "Snapshots:"
+                    for f in $(ls -1t "$SNAP_DIR"/*.tar.gz); do echo "  $(basename "$f")  ($(du -h "$f" | cut -f1))"; done
+                else
+                    echo "No snapshots yet."
+                fi
+                ;;
+            *)
+                if [ ! -e "$2" ]; then bad "'$2' not found."; exit 1; fi
+                target=$(realpath "$2")
+                base=$(basename "$target")
+                out="$SNAP_DIR/${base}.$(date +%Y%m%d-%H%M%S).tar.gz"
+                if tar -czf "$out" -C "$(dirname "$target")" "$base"; then
+                    ok "Snapshot saved: $(basename "$out") ($(du -h "$out" | cut -f1))"
+                else
+                    bad "Snapshot failed."
+                    exit 1
+                fi
+                ;;
+        esac
+        ;;
+
+    "restore")
+        if [ -z "$2" ]; then echo "Usage: acaciel restore <file_or_folder>"; exit 1; fi
+        target=$(realpath -m "$2")
+        base=$(basename "$target")
+        latest=$(ls -1t "$SNAP_DIR/${base}."*.tar.gz 2>/dev/null | head -1)
+        if [ -z "$latest" ]; then bad "No snapshot found for '$2'."; exit 1; fi
+        note "Latest snapshot: $(basename "$latest")"
+        read -rp "Restore it to ${target}? The current version is kept as ${target}.before-restore [y/N] " yn
+        case "$yn" in
+            y|Y)
+                if [ -e "$target" ]; then
+                    rm -rf "${target}.before-restore"
+                    mv "$target" "${target}.before-restore"
+                fi
+                if tar -xzf "$latest" -C "$(dirname "$target")"; then ok "Restored '${2}'."; else bad "Restore failed."; exit 1; fi
+                ;;
+            *) echo "Cancelled." ;;
+        esac
+        ;;
+
+    "net")
+        dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+        gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+        ip4=$(ip -4 addr show "$dev" 2>/dev/null | awk '/inet / {print $2; exit}')
+        ssid=$(nmcli -t -f active,ssid dev wifi 2>/dev/null | awk -F: '$1=="yes" {print $2; exit}')
+        dns=$(resolvectl dns 2>/dev/null | awk -F': ' 'NF>1 && $2!="" {print $2; exit}')
+        echo -e "${AMBER}=== Network ===${RESET}"
+        echo -e "${CYAN}Hostname:${RESET}   $(hostname)"
+        echo -e "${CYAN}Interface:${RESET}  ${dev:-none}"
+        echo -e "${CYAN}Local IP:${RESET}   ${ip4:-none}"
+        echo -e "${CYAN}Gateway:${RESET}    ${gw:-none}"
+        [ -n "$ssid" ] && echo -e "${CYAN}Wi-Fi:${RESET}      $ssid"
+        echo -e "${CYAN}DNS:${RESET}        ${dns:-unknown}"
+        if ping -c2 -W2 1.1.1.1 >/dev/null 2>&1; then
+            echo -e "${CYAN}Internet:${RESET}   $(ping -c2 -W2 1.1.1.1 | tail -1 | awk -F'/' '{print "reachable, " $5 " ms"}')"
+        else
+            echo -e "${CYAN}Internet:${RESET}   ${RED}not reachable${RESET}"
+        fi
+        ;;
+
+    "clean")
+        before=$(df --output=avail -B1 / | tail -1)
+        note "This will:"
+        echo "  - empty the Trash and clear thumbnails and Acaciel temp files"
+        echo "  - clean the apt download cache"
+        echo "  - trim system logs older than 7 days"
+        echo "  - remove old, unused Snap versions"
+        read -rp "Continue? [y/N] " yn
+        case "$yn" in y|Y) ;; *) echo "Cancelled."; exit 0 ;; esac
+        rm -rf "$HOME/.local/share/Trash/files/"* "$HOME/.local/share/Trash/info/"* 2>/dev/null
+        rm -rf "$HOME/.cache/thumbnails/"* 2>/dev/null
+        rm -rf /tmp/acaciel_* 2>/dev/null
+        $SUDO apt-get clean
+        $SUDO journalctl --vacuum-time=7d >/dev/null 2>&1
+        if command -v snap >/dev/null 2>&1; then
+            snap list --all 2>/dev/null | awk '/disabled/ {print $1, $3}' | while read -r n r; do
+                $SUDO snap remove "$n" --revision="$r" </dev/null >/dev/null 2>&1
+            done
+        fi
+        after=$(df --output=avail -B1 / | tail -1)
+        freed=$((after - before))
+        [ "$freed" -lt 0 ] && freed=0
+        ok "System cleaned. Freed about $(numfmt --to=iec "$freed")."
+        ;;
+
+    "help"|"-h"|"--help")
+        echo -e "${AMBER}Acaciel Command Reference:${RESET}"
+        echo "  acaciel                       - Opens the interactive Acaciel App"
+        echo "  acaciel update                - Opens AcaciaUpdates (--text for the terminal version)"
+        echo "  acaciel mobile                - Turns Mobile Mode on or off"
+        echo "  acaciel mobile on|off|status  - Explicit control and state"
+        echo "  acaciel mobile auto on|off    - Mobile Mode follows keyboard/mouse (needs a touchscreen)"
+        echo "  acaciel info                  - Shows AcaciaOS system details"
+        echo "  acaciel doctor                - Runs real system health checks"
+        echo "  acaciel app <name>            - Launches an app"
+        echo "  acaciel app list              - Lists the apps in your menu"
+        echo "  acaciel app install <name>    - Installs an app (apt or snap; --apt/--snap/--flatpak)"
+        echo "  acaciel app remove <name>     - Removes an app"
+        echo "  acaciel menu list             - Shows apps hidden from the menu"
+        echo "  acaciel menu hide <app>       - Hides an app from the menu"
+        echo "  acaciel menu show <app|all>   - Shows hidden apps again"
+        echo "  acaciel snap <path>           - Saves a snapshot (backup) of a file or folder"
+        echo "  acaciel snap list             - Lists snapshots"
+        echo "  acaciel restore <path>        - Restores the latest snapshot of a file or folder"
+        echo "  acaciel net                   - Shows network details and tests the connection"
+        echo "  acaciel clean                 - Frees disk space (trash, caches, old logs, old snaps)"
+        ;;
+
+    *)
+        bad "Unknown command: '$1'"
+        echo "Run 'acaciel help' to see all available commands."
+        exit 1
+        ;;
+esac
+EOF
+chmod 755 /usr/local/bin/acaciel
+
+# ---------- 5. Quick self-check (goes to the update log) ----------
+for f in /usr/local/bin/acaciel /usr/local/bin/acacia-mobile-home /usr/local/bin/acaciel-mobile-watch /usr/local/bin/acacia-menu; do
+  [ -x "$f" ] && echo "ok: $f" || echo "MISSING: $f"
+done
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' /usr/local/bin/acacia-mobile-home 2>/dev/null \
+  && echo "ok: mobile home app code is valid" || echo "ERROR: mobile home app code"
+python3 -c 'import gi; gi.require_version("Gtk","3.0"); from gi.repository import Gtk' >/dev/null 2>&1 \
+  && echo "ok: GTK for Python" || echo "MISSING: GTK for Python"
+
+echo "AcaciaOS 1.10.0 applied (Acaciel 1.2.0, Mobile Mode, tidy menu)."
+# ===================== end of 1.10.0 =====================
+
 # Acaciel installer for AcaciaOS - with Mobile Mode and a working "acaciel update"
 
 echo "Installing Acaciel (Ah-cay-shul) CLI for AcaciaOS..."
